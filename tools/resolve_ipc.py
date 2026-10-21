@@ -4,9 +4,13 @@ Emits the IPC TOML schema the client parses in IPCLoader.cpp:
 per-interface [Name] (interface_id, vtable_rva) plus per-method
 [Name.Method] (method_index, funcHash, wrapper_rva, fencepost, argc).
 
-funcHash / fencepost / argc / method_index / interface_id are wire-stable
-constants observed identical across builds; only the two RVAs resolve per
-build. Resolution chain per interface, all asserted unique (FAIL loudly):
+funcHash / fencepost values are wire constants the wrapper writes into the
+outgoing IPC buffer (4-byte appends). They are NOT build-stable: the
+1792192922 beta re-rolled five of six methods. Re-derive on failure:
+disassemble the slot's wrapper, find each `mov dword ptr [..], imm32`
+followed by the 4-byte append helper call; first immediate = funcHash,
+second = fencepost. Only the two RVAs resolve per build. Resolution chain
+per interface, all asserted unique (FAIL loudly):
 
   RTTI TypeDescriptor name (pinned, e.g. .?AVIClientUserMap@@)
     -> Complete Object Locator (sig == 1, pTD == TD)
@@ -43,18 +47,18 @@ IPC_IFACES = {
         "td": b".?AVIClientUserMap@@",
         "methods": [
             ("GetSteamID", 10, "D6FC3200", "D7058CA5", 0),
-            ("GetAppOwnershipTicketExtendedData", 105, "C7E71245",
-             "C8449840", 2),
-            ("RequestEncryptedAppTicket", 120, "25D6BB1D", "2646B663", 2),
-            ("GetEncryptedAppTicket", 121, "E0468CB4", "E0B80200", 1),
+            ("GetAppOwnershipTicketExtendedData", 105, "5578709F",
+             "55D3418F", 2),
+            ("RequestEncryptedAppTicket", 120, "BBB80477", "BC2703B9", 2),
+            ("GetEncryptedAppTicket", 121, "25D6BB1C", "2646F563", 1),
         ],
     },
     "IClientUtils": {
         "id": 4,
         "td": b".?AVIClientUtilsMap@@",
         "methods": [
-            ("GetAppID", 19, "09607EC4", "0AFE7552", 0),
-            ("GetAPICallResult", 24, "2D3D3947", "2EDF5EE6", 3),
+            ("GetAppID", 19, "09607EC2", "0AFEF352", 0),
+            ("GetAPICallResult", 24, "2D3D3979", "2EDFDD1A", 3),
         ],
     },
 }

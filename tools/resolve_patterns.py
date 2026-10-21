@@ -94,6 +94,24 @@ GROW_PREFIX = bytes.fromhex(
 # GetPackageInfo prologue (20B, disp-free).
 GPI_PREFIX = bytes.fromhex(
     "48 89 5C 24 18 89 54 24 10 55 56 57 48 83 EC 20 44 8B 49 20")
+# CUtlBufferEnsureCapacity prologue (identical in every published build; the
+# 6980e1cd beta gained a second exact-ref-set twin with a different prologue).
+CUBEC_PREFIX = bytes.fromhex(
+    "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 8D 7A 01 0F B6 49 1F")
+
+
+# Prologue byte pin per side/hook, applied after candidate selection.
+PROLOGUE_PINS = {"steamclient": {"CUtlBufferEnsureCapacity": CUBEC_PREFIX}}
+
+
+def filter_prologue(ctx, funcs, pin):
+    """Candidates whose first bytes don't match the pin stay excluded."""
+    ok = set()
+    for f in funcs:
+        o = ctx.img.rva2off(f)
+        if o is not None and bytes(ctx.img.buf[o:o + len(pin)]) == pin:
+            ok.add(f)
+    return ok
 
 
 def _only(cands, what):
@@ -731,6 +749,9 @@ def resolve(ctx: Ctx, side: str):
             funcs = ok
         else:
             funcs = ctx.referencing_funcs(anchor)
+        pin = PROLOGUE_PINS.get(side, {}).get(name)
+        if pin is not None:
+            funcs = filter_prologue(ctx, funcs, pin)
         if len(funcs) != 1:
             failed.append((name, f"{len(funcs)} referencing funcs"))
             continue

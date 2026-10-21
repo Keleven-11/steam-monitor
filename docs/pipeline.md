@@ -14,6 +14,18 @@ schema (`interface_id` / `vtable_rva` plus per-method `method_index` /
 4. Any FAIL → nothing published, an issue is filed, re-run via `workflow_dispatch`
 5. On success: `README.md` is re-rendered (knap, do not hand-edit) and committed with `pattern/` + `ipc/`
 
+Blocked-run triage notes:
+- Duplicate prevention: one open issue per beta SHA pair; a green publish
+  closes leftover issues whose title SHAs are now published.
+- `steamclient` anchor collisions: candidates can be pinned by prologue
+  bytes via `PROLOGUE_PINS` in `tools/resolve_patterns.py` (worked example:
+  the 1792192922 beta twins for `CUtlBufferEnsureCapacity`).
+- IPC funcHash/fencepost re-rolls: when a wrapper fails its hash check,
+  extract the new constants from the wrapper's outgoing-buffer writes —
+  each `mov dword ptr [..], imm32` followed by the 4-byte append helper
+  (`call <helper>`); first immediate is funcHash, second is fencepost.
+  Update `IPC_IFACES` in `tools/resolve_ipc.py` and re-run.
+
 No TOMLs are shipped or fetched — every hook derives from the DLLs alone.
 `tools/migrate_patterns.py` is a seed-era analysis aid, not in the pipeline.
 

@@ -318,5 +318,28 @@ class TestGetPackageInfo(unittest.TestCase):
         self.assertIn("2 GetPackageInfo cands", e)
 
 
+class TestProloguePin(unittest.TestCase):
+
+    def test_keeps_only_pinned_starts(self):
+        img = Img()
+        img.put(0x1000, rp.CUBEC_PREFIX + b"\x90" * 8)
+        img.put(0x2000, b"\x4c\x89\xa4\x24" + b"\x90" * 12)
+        img.put(0x3000, rp.CUBEC_PREFIX[:4] + b"\x90" * 12)
+        ctx = mkctx(img=img)
+        self.assertEqual(rp.filter_prologue(ctx, {0x1000, 0x2000, 0x3000},
+                                            rp.CUBEC_PREFIX), {0x1000})
+
+    def test_unmapped_rva_dropped(self):
+        img = Img()
+        img.put(0x1000, rp.CUBEC_PREFIX + b"\x90" * 8)
+        ctx = mkctx(img=img)
+        self.assertEqual(rp.filter_prologue(ctx, {0x1000, 0x9999},
+                                            rp.CUBEC_PREFIX), {0x1000})
+
+    def test_empty_input(self):
+        ctx = mkctx(img=Img())
+        self.assertEqual(rp.filter_prologue(ctx, set(), rp.CUBEC_PREFIX), set())
+
+
 if __name__ == "__main__":
     unittest.main()
