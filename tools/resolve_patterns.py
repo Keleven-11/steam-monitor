@@ -47,7 +47,10 @@ ANCHORS = {
     },
 }
 
-CS = "C:\\buildworker\\steam_rel_client_win64\\build\\src\\"
+CS = "C:\\buildworker\\steam_rel_client_*\\build\\src\\"
+# Valve builds from differently-named branches (win64, hotfix_win64, ...),
+# which changes this prefix; normalize it so path anchors stay stable.
+_SRC_NORM = "C:\\buildworker\\steam_rel_client_*\\build\\src\\"
 EXACT_ANCHORS = {
     # hook -> full string-ref set (exactly one func matches).
     "steamclient": {
@@ -77,7 +80,8 @@ CALLEE_ANCHORS = {
 
 # Phase 2: call-graph rules. Each picker returns (rva, None) or (None, reason).
 
-COLDWANT = sorted([CS + "public\\tier1\\utlrbtree.h", "IsValidIndex( elem )"])
+COLDWANT = sorted([CS + "public\\tier1\\utlrbtree.h",
+                   "IsValidIndex( elem )"])
 WS_NAME = "CWebSocketConnection::BBuildAndAsyncSendFrame"
 WS_MODE = "Web socket client mode not supported"
 HUB_REFS = ["( &src < m_Memory.Base() ) || ( &src >= ( m_Memory.Base() + m_Size ) )",
@@ -313,9 +317,11 @@ def p2_readasbin(ctx, lp, cm):
 
 def p2_findcreate(ctx, rb, cm):
     rbf = ctx.refs_by_func()
-    base = rb & ~0xFFFF
+    # Neighbor leaf funcs live on either side of rb; center the window on rb
+    # instead of a 64K-aligned block so a function just below a boundary still
+    # qualifies (the 1792711043 beta moved FindOrCreateKey across one).
     leaves = [t for t in ctx.entries
-              if base <= t < base + 0x10000 and not rbf.get(t)
+              if rb - 0x10000 <= t < rb + 0x10000 and not rbf.get(t)
               and not ctx.callees(t) and len(cm.get(t, ())) >= 100]
     return _max_unique([(t, len(cm.get(t, ()))) for t in leaves],
                        "FindOrCreate cands")
@@ -423,7 +429,15 @@ class Ctx:
                     while j < len(blob) and 32 <= blob[j] < 127:
                         j += 1
                     if j - i >= 5 and (j >= len(blob) or blob[j] == 0):
-                        self.strings[va + i] = blob[i:j].decode()
+                        text = blob[i:j].decode()
+                        marker = "steam_rel_client_"
+                        k = text.find(marker)
+                        if k != -1:
+                            tail = text.find("\\build\\src\\", k + len(marker))
+                            if tail != -1:
+                                text = (text[:k + len(marker)] + "*"
+                                        + text[tail:])
+                        self.strings[va + i] = text
                     i = max(j, i + 1)
                 else:
                     i += 1

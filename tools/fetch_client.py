@@ -121,6 +121,7 @@ def main() -> int:
         versions = json.loads(Path(args.versions_file).read_text())
 
     fetched: list[tuple[str, str, dict[str, str], dict[str, bytes]]] = []
+    skipped_known: list[tuple[str, dict[str, str]]] = []
     try:
         for channel in args.channels:
             version, packages = parse_manifest(
@@ -130,6 +131,7 @@ def main() -> int:
 
             if resolve_known(version, versions, args.published_shas) is not None:
                 print(f"version already published, skipping download ({channel})")
+                skipped_known.append((version, versions[version]))
                 continue
 
             dlls: dict[str, bytes] | None = None
@@ -158,6 +160,12 @@ def main() -> int:
         )
         if args.versions_file is not None:
             versions[version] = {"channel": channel, **shas}
+    # A build promoted between channels (beta -> stable) arrives as a "new"
+    # version whose SHAs are already published; record it anyway so the next
+    # run skips via versions.json instead of re-downloading forever.
+    if args.versions_file is not None:
+        for version, known in skipped_known:
+            versions.setdefault(version, known)
     if args.versions_file is not None and fetched:
         versions_path = Path(args.versions_file)
         versions_path.parent.mkdir(parents=True, exist_ok=True)

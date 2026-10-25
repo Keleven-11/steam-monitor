@@ -50,7 +50,8 @@ jobs:
           python3 tools/fetch_client.py --out bins/ --channels stable beta --published-shas $PUBLISHED --versions-file pattern/versions.json
           CODE=$?
           set -e
-          # exit 2 = all SHAs published: files still written, downstream skips.
+          # exit 2 = all SHAs published: versions.json is still updated, but
+          # downstream skips because no new TOML is needed.
           if [ "$CODE" -eq 2 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           elif [ "$CODE" -ne 0 ]; then
