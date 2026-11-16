@@ -156,6 +156,59 @@ class ChannelManifestTests(unittest.TestCase):
         )
 
 
+class FetchUrlTests(unittest.TestCase):
+    def _response(self, data):
+        response = mock.MagicMock()
+        response.read.return_value = data
+        context = mock.MagicMock()
+        context.__enter__.return_value = response
+        return context
+
+    def test_retries_503_then_succeeds(self):
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "https://example", 503, "Service Unavailable", None, None
+        )
+        with mock.patch.object(
+            fetch_client.urllib.request,
+            "urlopen",
+            side_effect=[error, self._response(b"data")],
+        ) as urlopen:
+            with mock.patch.object(fetch_client.time, "sleep") as sleep:
+                self.assertEqual(fetch_client.fetch_url("https://example"), b"data")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_404_is_not_retried(self):
+        import urllib.error
+
+        error = urllib.error.HTTPError("https://example", 404, "Not Found", None, None)
+        with mock.patch.object(
+            fetch_client.urllib.request, "urlopen", side_effect=[error]
+        ) as urlopen:
+            with mock.patch.object(fetch_client.time, "sleep") as sleep:
+                with self.assertRaises(urllib.error.HTTPError):
+                    fetch_client.fetch_url("https://example")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_url_error_exhausts_attempts(self):
+        import urllib.error
+
+        error = urllib.error.URLError("timed out")
+        with mock.patch.object(
+            fetch_client.urllib.request,
+            "urlopen",
+            side_effect=[error, error, error, error],
+        ) as urlopen:
+            with mock.patch.object(fetch_client.time, "sleep") as sleep:
+                with self.assertRaises(urllib.error.URLError):
+                    fetch_client.fetch_url("https://example")
+        self.assertEqual(urlopen.call_count, 4)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4, 8])
+
+
 class FetchMainTests(unittest.TestCase):
     def _manifest(self, version):
         return (

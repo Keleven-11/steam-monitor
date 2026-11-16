@@ -18,6 +18,8 @@ import io
 import json
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -34,6 +36,11 @@ _VERSION_RE = re.compile(r'"version"\s+"(\d+)"')
 # Package blocks are indented; the root platform block ("win64"\n{) is not.
 _BLOCK_RE = re.compile(r'\r?\n[ \t]+"([a-z0-9_]+)"[ \t]*\r?\n[ \t]*\{([^}]*)\}')
 _FILE_RE = re.compile(r'"file"\s+"([^"]+)"')
+
+# Retry only transient CDN failures; a 4xx is a real error.
+_RETRYABLE_HTTP = {500, 502, 503, 504}
+_FETCH_ATTEMPTS = 4  # initial try + 3 retries
+_RETRY_BACKOFF_SECONDS = 2
 
 
 class Package(NamedTuple):
@@ -97,9 +104,22 @@ def parse_manifest(text: str) -> tuple[str, list[Package]]:
 
 
 def fetch_url(url: str) -> bytes:
-    """Network adapter (untested seam boundary)."""
-    with urllib.request.urlopen(url, timeout=120) as r:
-        return r.read()
+    """Network adapter with bounded retries for transient CDN failures."""
+    for attempt in range(1, _FETCH_ATTEMPTS + 1):
+        delay = _RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code not in _RETRYABLE_HTTP or attempt == _FETCH_ATTEMPTS:
+                raise
+            print(f"fetch failed (HTTP {e.code}); retrying in {delay}s")
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == _FETCH_ATTEMPTS:
+                raise
+            print(f"fetch failed ({e}); retrying in {delay}s")
+        time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def main() -> int:
