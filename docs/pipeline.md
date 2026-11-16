@@ -20,12 +20,13 @@ Blocked-run triage notes:
 - `steamclient` anchor collisions: candidates can be pinned by prologue
   bytes via `PROLOGUE_PINS` in `tools/resolve_patterns.py` (worked example:
   the 1792192922 beta twins for `CUtlBufferEnsureCapacity`).
-- IPC funcHash/fencepost re-rolls: when a wrapper fails its hash check,
-  extract the new constants from the wrapper's outgoing-buffer writes —
-  each `mov dword ptr [..], imm32` followed by the 4-byte append helper
-  (`call <helper>`); first immediate is funcHash, second is fencepost.
-  Update the channel's entry in `IPC_CONSTANTS` in `tools/resolve_ipc.py`
-  and re-run.
+- IPC funcHash/fencepost are read out of the wrapper body on every run
+  (`mov r8d, 4` = `41 B8 04 00 00 00`, then a `C7 /0 imm32` memory store;
+  first immediate is funcHash, second is fencepost). There is no
+  hand-maintained constant table: stable and beta re-roll these
+  independently, so a table silently goes stale — that is exactly what
+  blocked every run between 2026-11-10 and 2026-11-16. A wrapper without
+  exactly two immediate 4-byte appends FAILs loudly instead.
 
 No TOMLs are shipped or fetched — every hook derives from the DLLs alone.
 `tools/migrate_patterns.py` is a seed-era analysis aid, not in the pipeline.

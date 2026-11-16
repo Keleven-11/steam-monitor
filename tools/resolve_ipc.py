@@ -4,23 +4,35 @@ Emits the IPC TOML schema the client parses in IPCLoader.cpp:
 per-interface [Name] (interface_id, vtable_rva) plus per-method
 [Name.Method] (method_index, funcHash, wrapper_rva, fencepost, argc).
 
-funcHash / fencepost values are wire constants the wrapper writes into the
-outgoing IPC buffer (4-byte appends). They are NOT build-stable: the
-1792192922 beta re-rolled five of six methods. Re-derive on failure:
-disassemble the slot's wrapper, find each `mov dword ptr [..], imm32`
-followed by the 4-byte append helper call; first immediate = funcHash,
-second = fencepost. Only the two RVAs resolve per build. Resolution chain
-per interface, all asserted unique (FAIL loudly):
+funcHash / fencepost are wire constants the wrapper writes into the outgoing
+IPC buffer. They are NOT build-stable and stable/beta re-roll them
+independently, so they are read out of the wrapper body on every run - there
+is no hand-maintained constant table to go stale. A 4-byte append always has
+this shape:
+
+    lea  rdx, [buf]
+    mov  r8d, 4                      ; 41 B8 04 00 00 00
+    mov  dword ptr [buf], imm32      ; C7 /0 imm32
+    lea  rcx, [bufobj]
+    call <append helper>
+
+The same shape also carries dynamic values (89 /r stores a register, not an
+immediate), and 8-byte appends (41 B8 08 ...) carry neither constant, so the
+scan keeps only immediate stores behind a 4-byte append. Exactly two must
+appear, in order: first funcHash, second fencepost. Anything else FAILs
+loudly - never guess.
+
+Resolution chain per interface, all asserted unique (FAIL loudly):
 
   RTTI TypeDescriptor name (pinned, e.g. .?AVIClientUserMap@@)
     -> Complete Object Locator (sig == 1, pTD == TD)
       -> vtable: the address X whose qword at X-8 == COL VA
         -> wrapper: qword at X + method_index * 8, must be a pdata entry
-           whose first HASH_WINDOW bytes contain the method's funcHash.
+           whose body carries the funcHash/fencepost pair
 
 Usage:
-    python3 tools/resolve_ipc.py resolve --dll <dll> --channel stable
-        --out-dir ipc/ [--verify <ground-truth.toml>]
+    python3 tools/resolve_ipc.py resolve --dll <dll> --out-dir ipc/
+        [--channel stable] [--verify <ground-truth.toml>]
 """
 
 import argparse
@@ -37,14 +49,15 @@ spec = importlib.util.spec_from_file_location(
 rp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rp)
 
-# Real wrappers write funcHash then fencepost near the prologue; requiring
-# both within this window rejects tail-byte coincidences in neighbors.
-HASH_WINDOW = 0x100
+# mov r8d, 4 - the append length that carries a 4-byte wire constant.
+APPEND_4_PREFIX = bytes([0x41, 0xB8, 0x04, 0x00, 0x00, 0x00])
+
+# Used only when the exception directory has no range for a wrapper.
+SCAN_LIMIT = 0x400
 
 # iface -> interface_id, RTTI TypeDescriptor name, and methods:
-# (method, method_index, argc). Method order/indexes are wire-stable; only
-# the funcHash/fencepost pair differs per channel, and beta builds have
-# shifted a slot by one, so a small neighborhood is probed.
+# (method, method_index, argc). Method indexes are wire-stable; the
+# funcHash/fencepost pair is read from the wrapper on every build.
 IPC_IFACES = {
     "IClientUser": {
         "id": 1,
@@ -63,35 +76,6 @@ IPC_IFACES = {
             ("GetAppID", 19, 0),
             ("GetAPICallResult", 24, 3),
         ],
-    },
-}
-
-# Per-channel wire constants re-derived from the wrapper bodies. Stable and
-# beta are separate builds and re-roll these independently.
-IPC_CONSTANTS = {
-    "stable": {
-        "IClientUser": {
-            "GetSteamID": [("D6FC3200", "D7058CA5")],
-            "GetAppOwnershipTicketExtendedData": [("C7E71245", "C8449840")],
-            "RequestEncryptedAppTicket": [("25D6BB1D", "2646B663")],
-            "GetEncryptedAppTicket": [("E0468CB4", "E0B80200")],
-        },
-        "IClientUtils": {
-            "GetAppID": [("09607EC4", "0AFE7552")],
-            "GetAPICallResult": [("2D3D3947", "2EDF5EE6")],
-        },
-    },
-    "beta": {
-        "IClientUser": {
-            "GetSteamID": [("D6FC3200", "D7058CA5")],
-            "GetAppOwnershipTicketExtendedData": [("C7E71244", "C844D740")],
-            "RequestEncryptedAppTicket": [("25D6BB1C", "2646F563")],
-            "GetEncryptedAppTicket": [("E0468CB5", "E0B84102")],
-        },
-        "IClientUtils": {
-            "GetAppID": [("09607EC2", "0AFEF352")],
-            "GetAPICallResult": [("2D3D3979", "2EDFDD1A")],
-        },
     },
 }
 
@@ -135,6 +119,19 @@ def _u64(img, rva):
     if o is None:
         return None
     return struct.unpack_from("<Q", img.buf, o)[0]
+
+
+def pdata_ranges(img):
+    """func RVA -> end RVA, straight from the exception directory."""
+    off = img.rva2off(img.exc_rva)
+    if off is None:
+        return {}
+    out = {}
+    for i in range(img.exc_sz // 12):
+        begin, end, _unwind = struct.unpack_from("<III", img.buf, off + i * 12)
+        if begin:
+            out[begin] = end
+    return out
 
 
 def find_td(img, spans, name: bytes):
@@ -186,28 +183,73 @@ def find_vtable(img, spans, td_rva, base):
     return next(iter(match)), None
 
 
-def check_wrapper(img, func_rva, funchash: str, pdata) -> bool:
+def imm32_store(body, i):
+    """Decode a C7 /0 memory-immediate store at body[i]; return imm32 or None.
+
+    A register-direct operand (mod == 3) is not a memory store and is
+    rejected: the wire constants are always written into the outgoing-buffer
+    slot, never into a register.
+    """
+    if i + 2 > len(body) or body[i] != 0xC7:
+        return None
+    modrm = body[i + 1]
+    mod, rm = modrm >> 6, modrm & 7
+    if mod == 3:
+        return None
+    n = i + 2
+    if rm == 4:
+        if n >= len(body):
+            return None
+        sib = body[n]
+        n += 1
+        if mod == 0 and (sib & 7) == 5:
+            n += 4
+    elif rm == 5 and mod == 0:
+        n += 4
+    if mod == 1:
+        n += 1
+    elif mod == 2:
+        n += 4
+    if n + 4 > len(body):
+        return None
+    return int.from_bytes(body[n:n + 4], "little")
+
+
+def read_append_consts(img, func_rva, func_end, pdata):
+    """Read (funcHash, fencepost) out of a wrapper body.
+
+    Returns ((funchash, fencepost), None) or (None, reason). Never guesses:
+    anything other than exactly two immediate 4-byte appends is a failure.
+    """
     if func_rva not in pdata:
-        return False
+        return None, f"wrapper {func_rva:#x} is not a pdata entry"
     o = img.rva2off(func_rva)
     if o is None:
-        return False
-    return bytes.fromhex(funchash)[::-1] in bytes(img.buf[o:o + HASH_WINDOW])
+        return None, f"wrapper {func_rva:#x} has no file offset"
+    last = max(func_end, func_rva + 1) - 1
+    end_off = img.rva2off(last)
+    body = bytes(img.buf[o:(end_off + 1) if end_off is not None
+                         else o + SCAN_LIMIT])
+
+    consts = []
+    i = body.find(APPEND_4_PREFIX)
+    while i >= 0:
+        value = imm32_store(body, i + len(APPEND_4_PREFIX))
+        if value is not None:
+            consts.append(value)
+        i = body.find(APPEND_4_PREFIX, i + len(APPEND_4_PREFIX))
+
+    if len(consts) != 2:
+        seen = ", ".join(f"{c:#010x}" for c in consts) or "none"
+        return None, ("expected 2 immediate 4-byte appends "
+                      f"(funcHash, fencepost), found {len(consts)}: {seen}")
+    funchash, fencepost = consts
+    if funchash == fencepost:
+        return None, f"funcHash and fencepost are both {funchash:#010x}"
+    return (funchash, fencepost), None
 
 
-def check_wrapper_pair(img, func_rva, funchash: str, fencepost: str,
-                       pdata) -> bool:
-    if func_rva not in pdata:
-        return False
-    o = img.rva2off(func_rva)
-    if o is None:
-        return False
-    head = bytes(img.buf[o:o + HASH_WINDOW])
-    return (bytes.fromhex(funchash)[::-1] in head
-            and bytes.fromhex(fencepost)[::-1] in head)
-
-
-def resolve_iface(spec, img, spans, base, pdata, consts):
+def resolve_iface(spec, img, spans, base, pdata, pends):
     td = find_td(img, spans, spec["td"])
     if td is None:
         return None, None, f'no TD {spec["td"]!r}'
@@ -216,23 +258,15 @@ def resolve_iface(spec, img, spans, base, pdata, consts):
         return None, None, err
     methods = {}
     for name, idx, _argc in spec["methods"]:
-        found = None
-        for slot in (idx, idx - 1, idx + 1):
-            if slot < 0:
-                continue
-            f = _u64(img, vt + slot * 8)
-            if f is None:
-                continue
-            f -= base
-            for funchash, fencepost in consts[name]:
-                if check_wrapper_pair(img, f, funchash, fencepost, pdata):
-                    found = (f, funchash, fencepost, slot)
-                    break
-            if found:
-                break
-        if not found:
-            return None, None, f"{name}: no slot/hash match near {idx}"
-        methods[name] = found
+        slot = _u64(img, vt + idx * 8)
+        if slot is None:
+            return None, None, f"{name}: slot {idx} unreadable"
+        func_rva = slot - base
+        pair, err = read_append_consts(
+            img, func_rva, pends.get(func_rva, func_rva + SCAN_LIMIT), pdata)
+        if err is not None:
+            return None, None, f"{name}: {err}"
+        methods[name] = (func_rva, pair[0], pair[1], idx)
     return vt, methods, None
 
 
@@ -246,9 +280,9 @@ def render_toml(resolved) -> str:
             wrapper, funchash, fence, actual_idx = methods[name]
             parts.append("\n".join(
                 [f"[{iface}.{name}]", f"method_index = {actual_idx}",
-                 f'funcHash = "0x{funchash.upper()}"',
+                 f'funcHash = "0x{funchash:08X}"',
                  f'wrapper_rva = "0x{wrapper:X}"',
-                 f'fencepost = "0x{fence.upper()}"', f"argc = {argc}"]))
+                 f'fencepost = "0x{fence:08X}"', f"argc = {argc}"]))
     head = "# MACHINE-GENERATED by tools/resolve_ipc.py - do not hand-edit"
     return head + "\n" + "\n\n".join(parts) + "\n"
 
@@ -261,36 +295,48 @@ def cmd_resolve(args):
         print("FAIL: no data sections")
         return 1
     base = image_base(img.buf)
-    entries = sorted(img.pdata_entries())
-    pdata = set(entries)
+    pends = pdata_ranges(img)
+    pdata = set(pends)
+    if args.channel:
+        print(f"channel {args.channel}: wire constants are read per build, "
+              "the channel no longer selects a table")
     resolved, failed = [], []
-    for iface, spec in IPC_IFACES.items():
-        consts = IPC_CONSTANTS[args.channel][iface]
-        vt, methods, err = resolve_iface(spec, img, spans, base, pdata, consts)
+    for iface, iface_spec in IPC_IFACES.items():
+        vt, methods, err = resolve_iface(
+            iface_spec, img, spans, base, pdata, pends)
         if err is not None:
             failed.append((iface, err))
             print(f"FAIL {iface}: {err}")
         else:
-            resolved.append((iface, spec, vt, methods))
+            resolved.append((iface, iface_spec, vt, methods))
             print(f"{iface}: vtable=0x{vt:X} " +
                   " ".join(f"{m}=0x{w[0]:X}" for m, w in methods.items()))
     if args.verify:
         truth = tomllib.load(open(args.verify, "rb"))
-        for iface, spec, vt, methods in resolved:
+        for iface, iface_spec, vt, methods in resolved:
             t = truth.get(iface, {})
-            mark = "OK" if t.get("vtable_rva") == f"0x{vt:X}" else \
-                f'MISMATCH truth={t.get("vtable_rva")}'
+            want_vt = t.get("vtable_rva")
+            mark = "OK" if want_vt == f"0x{vt:X}" else \
+                f"MISMATCH truth={want_vt}"
             print(f"{mark} {iface}.vtable_rva")
-            for name, idx, _argc in spec["methods"]:
-                tm = truth.get(iface, {}).get(name, {})
-                mark = "OK" if tm.get("wrapper_rva") == \
-                    f'0x{methods[name][0]:X}' else \
-                    f'MISMATCH truth={tm.get("wrapper_rva")}'
-                print(f"{mark} {iface}.{name}.wrapper_rva")
+            for name, _idx, _argc in iface_spec["methods"]:
+                tm = t.get(name, {})
+                if not isinstance(tm, dict):
+                    print(f"MISSING {iface}.{name} in truth")
+                    continue
+                wrapper, funchash, fence, _ = methods[name]
+                for label, got, want in (
+                    ("wrapper_rva", f"0x{wrapper:X}", tm.get("wrapper_rva")),
+                    ("funcHash", f"0x{funchash:08X}", tm.get("funcHash")),
+                    ("fencepost", f"0x{fence:08X}", tm.get("fencepost")),
+                ):
+                    mark = "OK" if got == want else f"MISMATCH truth={want}"
+                    print(f"{mark} {iface}.{name}.{label}")
     if args.out_dir and not failed:
         from hashlib import sha256
         text = render_toml(resolved)
-        out = Path(args.out_dir) / "steamclient" / f"{sha256(dll.read_bytes()).hexdigest()}.toml"
+        stamp = sha256(dll.read_bytes()).hexdigest()
+        out = Path(args.out_dir) / "steamclient" / f"{stamp}.toml"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text, newline="\n")
         print(f"wrote {out}")
@@ -302,7 +348,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("resolve")
     r.add_argument("--dll", required=True)
-    r.add_argument("--channel", required=True, choices=sorted(IPC_CONSTANTS))
+    r.add_argument("--channel", default=None,
+                   help="only labels the log; constants are read per build")
     r.add_argument("--out-dir", default=None)
     r.add_argument("--verify", default=None)
     args = ap.parse_args()

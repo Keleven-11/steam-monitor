@@ -67,13 +67,13 @@ jobs:
           done
           echo "channels=$CHANNELS" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve patterns + IPC
-        id: resolve
+      - name: Resolve patterns
+        id: pattern
         if: steps.fetch.outputs.skip != 'true'
         run: |
-          : > skips.txt
+          : > skips_pattern.txt
           CODE_ALL=0
-          for channel in ${STEPS_FETCH_OUTPUTS_CHANNELS}; do
+          for channel in $STEPS_FETCH_OUTPUTS_CHANNELS; do
             set +e
             python3 tools/resolve_patterns.py resolve \
               --dll "bins/$channel/steamclient64.dll" --side steamclient \
@@ -83,14 +83,10 @@ jobs:
               --dll "bins/$channel/SteamUI.dll" --side steamui \
               --out-dir pattern/ > "resolve_sui_$channel.log" 2>&1
             CODE_SUI=$?
-            python3 tools/resolve_ipc.py resolve \
-              --dll "bins/$channel/steamclient64.dll" --channel "$channel" \
-              --out-dir ipc/ > "resolve_ipc_$channel.log" 2>&1
-            CODE_IPC=$?
             set -e
-            cat "resolve_sc_$channel.log" "resolve_sui_$channel.log" "resolve_ipc_$channel.log"
-            grep -E '^FAIL ' "resolve_sc_$channel.log" "resolve_sui_$channel.log" "resolve_ipc_$channel.log" >> skips.txt || true
-            if [ "$CODE_SC" -ne 0 ] || [ "$CODE_SUI" -ne 0 ] || [ "$CODE_IPC" -ne 0 ]; then
+            cat "resolve_sc_$channel.log" "resolve_sui_$channel.log"
+            grep -E '^FAIL ' "resolve_sc_$channel.log" "resolve_sui_$channel.log" >> skips_pattern.txt || true
+            if [ "$CODE_SC" -ne 0 ] || [ "$CODE_SUI" -ne 0 ]; then
               CODE_ALL=1
             fi
           done
@@ -98,72 +94,39 @@ jobs:
         env:
           STEPS_FETCH_OUTPUTS_CHANNELS: ${{ steps.fetch.outputs.channels }}
 
-      - name: File issue on unresolvable entries
-        if: steps.fetch.outputs.skip != 'true' && steps.resolve.outputs.code != '0'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          STABLE_SC: ${{ steps.fetch.outputs.sha_sc_stable }}
-          STABLE_SUI: ${{ steps.fetch.outputs.sha_sui_stable }}
-          BETA_SC: ${{ steps.fetch.outputs.sha_sc_beta }}
-          BETA_SUI: ${{ steps.fetch.outputs.sha_sui_beta }}
+      - name: Resolve IPC
+        id: ipc
+        if: steps.fetch.outputs.skip != 'true'
         run: |
-          # Fetch only downloads channels with unpublished SHAs; show the
-          # last-published stable build so the title stays a full fingerprint.
-          read STABLE_SC STABLE_SUI < <(python3 -c "
-          import json
-          v = json.load(open('pattern/versions.json'))
-          s = {k: d for k, d in v.items() if d.get('channel') == 'stable'}
-          if s:
-              d = s[max(s, key=int)]
-              print(d['steamclient64.dll'], d['SteamUI.dll'])
-          else:
-              print('', '')
-          ")
-          # One open issue per blocked SHA pair is enough; fresh logs live in
-          # the Actions run this issue body would link to anyway.
-          if gh issue list --state open --json title --jq '.[].title' \
-              | grep -qF "beta ${BETA_SC}/${BETA_SUI}"; then
-            echo "blocked issue for beta ${BETA_SC}/${BETA_SUI} already open, skipping"
-            exit 0
-          fi
-          {
-            echo "Full log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo ""
-            echo "Nothing was published (block-on-failure). Triage the skipped entries by hand, then re-run with workflow_dispatch."
-            echo ""
-            cat skips.txt
-          } > issue_body.md
-          gh issue create \
-            --title "Pattern resolve blocked: stable ${STABLE_SC}/${STABLE_SUI}, beta ${BETA_SC}/${BETA_SUI}" \
-            --body-file issue_body.md
-
-      - name: Close resolved blocked issues
-        if: steps.fetch.outputs.skip != 'true' && steps.resolve.outputs.code == '0'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # A SHA in an issue title is published when its TOML exists under
-          # pattern/; publish is all-or-nothing, so every token present means
-          # the whole blocked build landed.
-          gh issue list --state open --search "Pattern resolve blocked in:title" \
-            --json number,title \
-            --jq '.[] | "\(.number)\t\(.title)"' | while IFS="$(printf '\t')" read -r num title; do
-            shas=$(echo "$title" | grep -oE '[0-9a-f]{64}' || true)
-            if [ -z "$shas" ]; then continue; fi
-            ok=1
-            for s in $shas; do
-              if [ ! -f "pattern/steamclient/$s.toml" ] && [ ! -f "pattern/steamui/$s.toml" ]; then
-                ok=0
-              fi
-            done
-            if [ "$ok" -eq 1 ]; then
-              gh issue close "$num" \
-                --comment "All SHAs from this issue are now published (run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+          : > skips_ipc.txt
+          CODE_ALL=0
+          for channel in $STEPS_FETCH_OUTPUTS_CHANNELS; do
+            set +e
+            # funcHash / fencepost are read out of the wrapper body on every
+            # build, so one binary resolves the same whichever channel it
+            # arrived on - the channel no longer selects a constant table.
+            python3 tools/resolve_ipc.py resolve \
+              --dll "bins/$channel/steamclient64.dll" --channel "$channel" \
+              --out-dir ipc/ > "resolve_ipc_$channel.log" 2>&1
+            CODE_IPC=$?
+            set -e
+            cat "resolve_ipc_$channel.log"
+            grep -E '^FAIL ' "resolve_ipc_$channel.log" >> skips_ipc.txt || true
+            if [ "$CODE_IPC" -ne 0 ]; then
+              CODE_ALL=1
             fi
           done
+          echo "code=$CODE_ALL" >> "$GITHUB_OUTPUT"
+        env:
+          STEPS_FETCH_OUTPUTS_CHANNELS: ${{ steps.fetch.outputs.channels }}
 
       - name: Publish
-        if: steps.fetch.outputs.skip != 'true' && steps.resolve.outputs.code == '0'
+        # Either resolver that succeeded still publishes: a blocked IPC feed
+        # must not hold back pattern hooks, and the other way round. This is
+        # only skipped when both sides failed and nothing was written.
+        if: |
+          steps.fetch.outputs.skip != 'true' &&
+          (steps.pattern.outputs.code == '0' || steps.ipc.outputs.code == '0')
         env:
           # README timestamps render in runner-local time; pin UTC.
           TZ: UTC
@@ -175,5 +138,103 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add pattern/ ipc/ README.md
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+            exit 0
+          fi
           git commit -m "Update Steam rule patterns (stable $(ver stable), beta $(ver beta))"
           git push
+
+      - name: Report blocked resolvers
+        # A repeat failure appends a comment instead of stopping at "already
+        # open". That early exit is why a frozen feed stayed green for a week.
+        if: |
+          steps.fetch.outputs.skip != 'true' &&
+          (steps.pattern.outputs.code != '0' || steps.ipc.outputs.code != '0')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STABLE_SC: ${{ steps.fetch.outputs.sha_sc_stable }}
+          STABLE_SUI: ${{ steps.fetch.outputs.sha_sui_stable }}
+          BETA_SC: ${{ steps.fetch.outputs.sha_sc_beta }}
+          BETA_SUI: ${{ steps.fetch.outputs.sha_sui_beta }}
+          PATTERN_CODE: ${{ steps.pattern.outputs.code }}
+          IPC_CODE: ${{ steps.ipc.outputs.code }}
+        run: |
+          for side in pattern ipc; do
+            case "$side" in
+              pattern) code="$PATTERN_CODE"; skipfile=skips_pattern.txt ;;
+              ipc)     code="$IPC_CODE";     skipfile=skips_ipc.txt ;;
+            esac
+            # Unset means the side never ran (fetch skipped), not a failure.
+            if [ -z "$code" ] || [ "$code" = "0" ]; then
+              continue
+            fi
+            {
+              echo "Full log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              echo ""
+              echo "stable: $STABLE_SC/$STABLE_SUI"
+              echo "beta:   $BETA_SC/$BETA_SUI"
+              echo ""
+              echo "Only the $side resolver is blocked; the other side still published."
+              echo ""
+              cat "$skipfile" 2>/dev/null || echo "(no FAIL lines captured)"
+            } > body_$side.md
+            num=$(gh issue list --state open --search "Resolver blocked: $side in:title" \
+                      --json number --jq '.[0].number')
+            if [ -n "$num" ]; then
+              echo "resolution still blocked for $side; commenting on #$num"
+              gh issue comment "$num" --body-file "body_$side.md"
+            else
+              gh issue create \
+                --title "Resolver blocked: $side (stable $STABLE_SC, beta $BETA_SC)" \
+                --body-file "body_$side.md"
+            fi
+          done
+
+      - name: Close recovered issues
+        if: |
+          steps.fetch.outputs.skip != 'true' &&
+          steps.pattern.outputs.code == '0' && steps.ipc.outputs.code == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Two title families: the old "Pattern resolve blocked: <sha>/<sha>"
+          # issues (all-or-nothing era) and the per-side "Resolver blocked"
+          # ones. Close by evidence, not by title alone: every SHA named in the
+          # title must have its TOMLs on disk, otherwise a half-published build
+          # would close its own alarm.
+          for q in "Pattern resolve blocked in:title" "Resolver blocked in:title"; do
+            gh issue list --state open --search "$q" \
+              --json number,title --jq '.[] | "\(.number)\t\(.title)"' |
+            while IFS="$(printf '\t')" read -r num title; do
+              shas=$(printf '%s' "$title" | grep -oE '[0-9a-f]{64}' || true)
+              if [ -z "$shas" ]; then
+                echo "#$num has no SHA in its title; leaving it open"
+                continue
+              fi
+              published=1
+              for s in $shas; do
+                if [ -f "pattern/steamclient/$s.toml" ] || [ -f "pattern/steamui/$s.toml" ]; then
+                  continue
+                fi
+                published=0
+              done
+              if [ "$published" -eq 1 ]; then
+                gh issue close "$num" \
+                  --comment "All SHAs from this issue are published (run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
+              else
+                echo "#$num still references unpublished SHAs; leaving it open"
+              fi
+            done
+          done
+
+      - name: Fail when a resolver is still blocked
+        # Red run, not a green one that quietly published half a feed.
+        if: |
+          steps.fetch.outputs.skip != 'true' &&
+          (steps.pattern.outputs.code != '0' || steps.ipc.outputs.code != '0')
+        run: |
+          echo "pattern code: ${{ steps.pattern.outputs.code }}"
+          echo "ipc code:     ${{ steps.ipc.outputs.code }}"
+          echo "The other side still published; this run is red on purpose."
+          exit 1
