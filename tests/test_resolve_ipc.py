@@ -217,6 +217,55 @@ class TestResolveIface(unittest.TestCase):
         self.assertIsNotNone(err)
 
 
+class TestSplitWrapperBody(unittest.TestCase):
+    """A wrapper split across contiguous pdata entries reads as one body.
+
+    beta 1795048523 moved IClientUser::GetSteamID's appends into the second
+    piece of a split body, so a front piece that does not end in RET has to be
+    followed into the next contiguous entry.
+    """
+
+    def _image(self, bodies):
+        img = FlatImg()
+        rva = WRAP
+        for body in bodies:
+            img.put(rva, body)
+            rva += len(body)
+        return img
+
+    def test_contiguous_pieces_are_one_body(self):
+        front = b"\x48\x89\x5C\x24\x18\x55" + DYN_APPEND   # no RET
+        back = imm_append(FUNC_HASH) + imm_append(FENCEPOST) + b"\xC3"
+        img = self._image([front, back])
+        pends = {WRAP: WRAP + len(front),
+                 WRAP + len(front): WRAP + len(front) + len(back)}
+        pair, err = ri.read_append_consts(
+            img, WRAP, WRAP + len(front), set(pends), pends)
+        self.assertIsNone(err)
+        self.assertEqual(pair, (FUNC_HASH, FENCEPOST))
+
+    def test_complete_body_never_absorbs_its_neighbour(self):
+        # Ends in RET, so the neighbour's appends must not be counted.
+        body = imm_append(FUNC_HASH) + imm_append(FENCEPOST) + b"\xC3"
+        neighbour = imm_append(0x11111111) + imm_append(0x22222222)
+        img = self._image([body, neighbour])
+        pends = {WRAP: WRAP + len(body),
+                 WRAP + len(body): WRAP + len(body) + len(neighbour)}
+        pair, err = ri.read_append_consts(img, WRAP, WRAP + len(body),
+                                         set(pends), pends)
+        self.assertIsNone(err)
+        self.assertEqual(pair, (FUNC_HASH, FENCEPOST))
+
+    def test_merge_does_not_follow_a_gap(self):
+        img = self._image([DYN_APPEND])
+        pends = {WRAP: WRAP + len(DYN_APPEND),
+                 WRAP + 0x100: WRAP + 0x140}
+        pair, err = ri.read_append_consts(
+            img, WRAP, WRAP + len(DYN_APPEND), set(pends), pends)
+        self.assertIsNone(pair)
+        self.assertIn("found 0", err)
+
+
 class TestRenderToml(unittest.TestCase):
     def test_schema_matches_upstream(self):
         spec = {"id": 1, "td": TD,

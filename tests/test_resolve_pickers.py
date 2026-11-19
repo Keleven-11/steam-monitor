@@ -71,6 +71,45 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("tie x", e)
 
 
+class TestPipeClient(unittest.TestCase):
+    """The hot spot is measured from the wrapper's end, not its start.
+
+    Steam grew this body 0x150 -> 0x160 (beta 1795048523) and moved the hot
+    spot 0xA0 -> 0xB0 with it; a tail-relative offset survives that.
+    """
+
+    @staticmethod
+    def _point(entry, size):
+        return entry + size - rp.PIPE_CLIENT_TAIL
+
+    def test_tail_offset_survives_a_grown_body(self):
+        # 0x150 came from stable, 0x160 from beta 1795048523; the answer is the
+        # same distance from the tail in both, so one constant covers both.
+        for size in (0x150, 0x160):
+            with self.subTest(size=hex(size)):
+                sizes = {0x8C5010: size, 0x900000: 0x158}
+                point = self._point(0x8C5010, size)
+                ctx = mkctx(entries=list(sizes), sizes=sizes, e8={point: 7})
+                self.assertEqual(rp.p2_pipeclient(ctx), (point, None))
+
+    def test_size_outside_the_band_is_ignored(self):
+        # 0x840 is another hot body in the same image; the band keeps it out.
+        sizes = {0xF366B0: 0x840, 0x8C5010: 0x150}
+        point = self._point(0x8C5010, 0x150)
+        ctx = mkctx(entries=list(sizes), sizes=sizes,
+                    e8={self._point(0xF366B0, 0x840): 648, point: 15})
+        self.assertEqual(rp.p2_pipeclient(ctx), (point, None))
+
+    def test_two_hot_bodies_still_fail_loudly(self):
+        sizes = {0x8C5010: 0x150, 0x900000: 0x158}
+        ctx = mkctx(entries=list(sizes), sizes=sizes,
+                    e8={self._point(0x8C5010, 0x150): 6,
+                        self._point(0x900000, 0x158): 6})
+        v, e = rp.p2_pipeclient(ctx)
+        self.assertIsNone(v)
+        self.assertIn("GetPipeClient cands", e)
+
+
 class TestFnvPins(unittest.TestCase):
     """FNV section ids are load-bearing: pin the known vectors."""
 

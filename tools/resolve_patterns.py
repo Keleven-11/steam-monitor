@@ -368,11 +368,24 @@ def p2_appid(ctx):
     return _only(hot, "GetAppIDPipe cands")
 
 
+# GetPipeClient: the hot spot is PIPE_CLIENT_TAIL bytes before the wrapper's
+# end. The band only has to contain the current body size, not pin it exactly.
+PIPE_CLIENT_SIZE = (0x140, 0x170)
+PIPE_CLIENT_TAIL = 0xB0
+
+
 def p2_pipeclient(ctx):
+    # The hot "GetPipeClient" body sits a fixed distance from the *end* of the
+    # wrapper, not from a fixed byte count: Steam grew this function 0x150 ->
+    # 0x160 in beta 1795048523 and the hot spot moved 0xA0 -> 0xB0 with it.
+    # Keying off the tail keeps one number valid across builds; the size band
+    # only has to bracket the current shape, so it is deliberately loose.
     cands = [t for t in ctx.entries
-             if not ctx.refs_by_func().get(t) and ctx.func_size(t) == 0x150]
-    counts = ctx.e8_count_many({t + 0xA0 for t in cands})
-    hot = [t + 0xA0 for t in cands if counts[t + 0xA0] >= 5]
+             if not ctx.refs_by_func().get(t)
+             and PIPE_CLIENT_SIZE[0] <= ctx.func_size(t) <= PIPE_CLIENT_SIZE[1]]
+    points = {t: t + ctx.func_size(t) - PIPE_CLIENT_TAIL for t in cands}
+    counts = ctx.e8_count_many(set(points.values()))
+    hot = [points[t] for t in cands if counts[points[t]] >= 5]
     return _only(hot, "GetPipeClient cands")
 
 

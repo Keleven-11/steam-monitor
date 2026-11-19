@@ -55,6 +55,10 @@ APPEND_4_PREFIX = bytes([0x41, 0xB8, 0x04, 0x00, 0x00, 0x00])
 # Used only when the exception directory has no range for a wrapper.
 SCAN_LIMIT = 0x400
 
+# A wrapper body can be split across contiguous pdata entries; merging follows
+# at most this many links so a corrupt table cannot walk the whole directory.
+SCAN_MERGE_LIMIT = 8
+
 # iface -> interface_id, RTTI TypeDescriptor name, and methods:
 # (method, method_index, argc). Method indexes are wire-stable; the
 # funcHash/fencepost pair is read from the wrapper on every build.
@@ -215,18 +219,35 @@ def imm32_store(body, i):
     return int.from_bytes(body[n:n + 4], "little")
 
 
-def read_append_consts(img, func_rva, func_end, pdata):
+def read_append_consts(img, func_rva, func_end, pdata, pends=None):
     """Read (funcHash, fencepost) out of a wrapper body.
 
     Returns ((funchash, fencepost), None) or (None, reason). Never guesses:
     anything other than exactly two immediate 4-byte appends is a failure.
+
+    A wrapper is sometimes split across several contiguous pdata entries - the
+    slot points at the head, and the appended constants live in the next piece
+    (IClientUser::GetSteamID did exactly this in beta 1795048523). Contiguous
+    entries are one body, so they are read as one.
     """
     if func_rva not in pdata:
         return None, f"wrapper {func_rva:#x} is not a pdata entry"
     o = img.rva2off(func_rva)
     if o is None:
         return None, f"wrapper {func_rva:#x} has no file offset"
-    last = max(func_end, func_rva + 1) - 1
+    # Only a piece that does not end in RET can be the front half of a split
+    # body: a complete wrapper always returns, and its neighbours are unrelated
+    # functions whose own appends must never be counted here.
+    end = func_end
+    for _ in range(SCAN_MERGE_LIMIT):
+        tail_off = img.rva2off(max(end, func_rva + 1) - 1)
+        if tail_off is None or img.buf[tail_off] == 0xC3:
+            break
+        nxt = (pends or {}).get(end)
+        if nxt is None or nxt <= end:
+            break
+        end = nxt
+    last = max(end, func_rva + 1) - 1
     end_off = img.rva2off(last)
     body = bytes(img.buf[o:(end_off + 1) if end_off is not None
                          else o + SCAN_LIMIT])
@@ -263,7 +284,8 @@ def resolve_iface(spec, img, spans, base, pdata, pends):
             return None, None, f"{name}: slot {idx} unreadable"
         func_rva = slot - base
         pair, err = read_append_consts(
-            img, func_rva, pends.get(func_rva, func_rva + SCAN_LIMIT), pdata)
+            img, func_rva, pends.get(func_rva, func_rva + SCAN_LIMIT), pdata,
+            pends)
         if err is not None:
             return None, None, f"{name}: {err}"
         methods[name] = (func_rva, pair[0], pair[1], idx)
