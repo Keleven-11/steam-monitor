@@ -162,8 +162,10 @@ jobs:
         run: |
           for side in pattern ipc; do
             case "$side" in
-              pattern) code="$PATTERN_CODE"; skipfile=skips_pattern.txt ;;
-              ipc)     code="$IPC_CODE";     skipfile=skips_ipc.txt ;;
+              pattern) code="$PATTERN_CODE"; skipfile=skips_pattern.txt
+                       other="$IPC_CODE";     other_side=ipc ;;
+              ipc)     code="$IPC_CODE";     skipfile=skips_ipc.txt
+                       other="$PATTERN_CODE"; other_side=pattern ;;
             esac
             # Unset means the side never ran (fetch skipped), not a failure.
             if [ -z "$code" ] || [ "$code" = "0" ]; then
@@ -175,7 +177,15 @@ jobs:
               echo "stable: $STABLE_SC/$STABLE_SUI"
               echo "beta:   $BETA_SC/$BETA_SUI"
               echo ""
-              echo "Only the $side resolver is blocked; the other side still published."
+              # Say what actually happened: with both sides red nothing was
+              # published, and claiming the other side shipped would hide that.
+              if [ -z "$other" ]; then
+                echo "The $other_side resolver never ran, so its side published nothing either."
+              elif [ "$other" = "0" ]; then
+                echo "Only the $side resolver is blocked; the $other_side side still published."
+              else
+                echo "Both resolvers failed ($side and $other_side); nothing was published."
+              fi
               echo ""
               cat "$skipfile" 2>/dev/null || echo "(no FAIL lines captured)"
             } > body_$side.md
@@ -233,8 +243,15 @@ jobs:
         if: |
           steps.fetch.outputs.skip != 'true' &&
           (steps.pattern.outputs.code != '0' || steps.ipc.outputs.code != '0')
+        env:
+          PATTERN_CODE: ${{ steps.pattern.outputs.code }}
+          IPC_CODE: ${{ steps.ipc.outputs.code }}
         run: |
-          echo "pattern code: ${{ steps.pattern.outputs.code }}"
-          echo "ipc code:     ${{ steps.ipc.outputs.code }}"
-          echo "The other side still published; this run is red on purpose."
+          echo "pattern code: $PATTERN_CODE"
+          echo "ipc code:     $IPC_CODE"
+          if [ "$PATTERN_CODE" = "0" ] || [ "$IPC_CODE" = "0" ]; then
+            echo "The other side still published; this run is red on purpose."
+          else
+            echo "Both resolvers failed; nothing was published."
+          fi
           exit 1
